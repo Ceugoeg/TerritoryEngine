@@ -1,0 +1,124 @@
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec2 position;
+    vec2 velocity;
+    vec4 color;
+};
+
+// 0: 粒子总池 (读写)
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+// 1: 网格表头 (只读)
+layout(std430, binding = 1) buffer GridHeadBuffer {
+    int gridHead[];
+};
+// 2: 链表数据 (只读)
+layout(std430, binding = 2) buffer LinkedListBuffer {
+    int particleList[];
+};
+
+uniform float u_DeltaTime;
+uniform int u_ParticleCount;
+uniform ivec2 u_GridSize;
+
+// 粒子的物理半径 (与 Vertex Shader 里的 0.005 对应)
+const float RADIUS = 0.005;
+
+void main() {
+    uint myID = gl_GlobalInvocationID.x;
+    if (myID >= u_ParticleCount) return;
+
+    // 把自己的状态先读到寄存器里 (极速访问)
+    Particle me = particles[myID];
+
+    // 1. 运动学积分
+    me.position += me.velocity * u_DeltaTime;
+
+    // 2. 计算我当前所在的网格坐标
+    vec2 normPos = clamp((me.position + 1.0) * 0.5, 0.0, 1.0);
+    ivec2 myCell = ivec2(normPos * vec2(u_GridSize));
+
+    // ---------------------------------------------------------
+    // 3. 【高阶奥义：基于空间哈希表的 O(1) 邻域碰撞检测】
+    // ---------------------------------------------------------
+    // 遍历我周围 3x3 的 9 个格子 (包含我自己所在的格子)
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            
+            ivec2 neighborCell = myCell + ivec2(x, y);
+            
+            // 越界检查
+            if (neighborCell.x < 0 || neighborCell.x >= u_GridSize.x ||
+                neighborCell.y < 0 || neighborCell.y >= u_GridSize.y) {
+                continue;
+            }
+
+            // 计算邻居格子的 1D 索引
+            int gridIndex = neighborCell.y * u_GridSize.x + neighborCell.x;
+            
+            // 拿到该格子的“表头指针”
+            int currID = gridHead[gridIndex];
+
+            // 顺藤摸瓜：遍历这个格子里的所有粒子！
+            int loopLimit = 0; // 保险栓，防止极端堆积导致的死循环
+            while (currID != -1 && loopLimit < 50) {
+                // 不能和自己发生碰撞
+                if (currID != myID) {
+                    Particle other = particles[currID];
+                    
+                    vec2 diff = me.position - other.position;
+                    float dist = length(diff);
+                    float minDist = RADIUS * 2.0;
+
+                    // 如果两球距离小于 2 倍半径，说明发生碰撞！
+                    if (dist > 0.0001 && dist < minDist) {
+                        vec2 normal = diff / dist;
+                        
+                        // a) 强制推开：防止两个粒子粘在一起 (位置修正)
+                        float overlap = minDist - dist;
+                        me.position += normal * overlap * 0.5;
+
+                        // b) 弹性碰撞：动量交换 (速度修正)
+                        vec2 relativeVel = me.velocity - other.velocity;
+                        float velAlongNormal = dot(relativeVel, normal);
+                        
+                        // 只有当两个粒子正在互相靠近时才反弹
+                        if (velAlongNormal < 0.0) {
+                            // 假设质量相同，恢复系数为 1.0 (完全弹性碰撞)
+                            me.velocity -= normal * velAlongNormal * 1.0;
+                        }
+                    }
+                }
+                // 核心：让指针跳向链表的下一个节点！
+                currID = particleList[currID];
+                loopLimit++;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 4. 边界反弹检测 (带半径偏移)
+    // ---------------------------------------------------------
+    if (me.position.x - RADIUS < -1.0) {
+        me.position.x = -1.0 + RADIUS;
+        me.velocity.x *= -1.0;
+    } else if (me.position.x + RADIUS > 1.0) {
+        me.position.x = 1.0 - RADIUS;
+        me.velocity.x *= -1.0;
+    }
+    
+    if (me.position.y - RADIUS < -1.0) {
+        me.position.y = -1.0 + RADIUS;
+        me.velocity.y *= -1.0;
+    } else if (me.position.y + RADIUS > 1.0) {
+        me.position.y = 1.0 - RADIUS;
+        me.velocity.y *= -1.0;
+    }
+
+    // 将算好的新状态写回 VRAM
+    particles[myID] = me;
+}
