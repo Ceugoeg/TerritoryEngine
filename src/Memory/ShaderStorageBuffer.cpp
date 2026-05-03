@@ -34,4 +34,10 @@ void ShaderStorageBuffer::SetData(const void* data, size_t size, size_t offset) 
     glNamedBufferSubData(m_RendererID, offset, size, data);
 }
 
+void ShaderStorageBuffer::ClearInt(int clearValue) {
+    // GL_R32I: 内部格式为 32位整型
+    // GL_RED_INTEGER, GL_INT: 传入数据的格式和类型
+    glClearNamedBufferData(m_RendererID, GL_R32I, GL_RED_INTEGER, GL_INT, &clearValue);
+}
+
 } // namespace Territory

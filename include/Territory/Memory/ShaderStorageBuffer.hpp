@@ -26,6 +26,8 @@ public:
     // 允许 CPU 偶尔介入修改数据 (比如玩家用鼠标强行点画了一块领地)
     void SetData(const void* data, size_t size, size_t offset = 0);
 
+    void ClearInt(int clearValue);
+
     uint32_t GetRendererID() const { return m_RendererID; }
 
 private:
