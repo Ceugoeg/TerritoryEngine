@@ -71,6 +71,12 @@ void Shader::SetInt(const std::string& name, int value) {
     glUniform1i(GetUniformLocation(name), value);
 }
 
+void Shader::SetInt2(const std::string& name, const glm::ivec2& value) {
+        GLint location = glGetUniformLocation(m_RendererID, name.c_str());
+        // 将 2 个 int 发送过去
+        glUniform2i(location, value.x, value.y);
+    }
+
 void Shader::SetFloat(const std::string& name, float value) {
     glUniform1f(GetUniformLocation(name), value);
 }

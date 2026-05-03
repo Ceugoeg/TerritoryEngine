@@ -27,6 +27,7 @@ public:
 
     // 向 GPU 传递 Uniform 变量 (CPU 向 GPU 传递少量控制参数的通道)
     void SetInt(const std::string& name, int value);
+    void SetInt2(const std::string& name, const glm::ivec2& value);
     void SetFloat(const std::string& name, float value);
     void SetVec3(const std::string& name, const glm::vec3& value);
     void SetMat4(const std::string& name, const glm::mat4& value);
