@@ -21,17 +21,27 @@ public:
     ColorWarApp(const Territory::WindowProps& props) 
         : Territory::Application(props), 
           m_ParticleCount(100000), 
-          m_GridRes(128) {} // 128x128 的网格划分
+          m_GridRes(128) {}
+
+    ~ColorWarApp() {
+        // 清理我们手动申请的 Dummy VAO
+        if (m_DummyVAO != 0) {
+            glDeleteVertexArrays(1, &m_DummyVAO);
+        }
+    }
 
 protected:
     void OnInit() override {
-        std::cout << "[ColorWar] Initializing GPU-Driven Spatial Pipeline...\n";
+        std::cout << "[ColorWar] Initializing GPU-Driven Territory Pipeline...\n";
 
+        // ==========================================
         // 1. 初始化十万粒子数据
+        // ==========================================
         std::vector<Particle> initialParticles(m_ParticleCount);
         std::mt19937 rng(std::random_device{}());
         std::uniform_real_distribution<float> distPos(-0.9f, 0.9f);
-        std::uniform_real_distribution<float> distVel(-0.3f, 0.3f);
+        // 赋予一点初速度，让它们爆炸般散开
+        std::uniform_real_distribution<float> distVel(-0.5f, 0.5f); 
 
         for (int i = 0; i < m_ParticleCount; ++i) {
             initialParticles[i].position = { distPos(rng), distPos(rng) };
@@ -45,82 +55,115 @@ protected:
             };
         }
 
-        // 2. 分配三大核心 SSBO
-        // 槽位 0: 粒子池
+        // ==========================================
+        // 2. 分配四大核心 SSBO (显存大管家)
+        // ==========================================
+        // [槽位 0]: 粒子池
         m_ParticleSSBO = std::make_shared<Territory::ShaderStorageBuffer>(
             initialParticles.data(), 
             m_ParticleCount * sizeof(Particle)
         );
-        // 槽位 1: 网格头 (128x128 个 int)
+        // [槽位 1]: 网格头 (空间哈希用)
         m_GridHeadSSBO = std::make_shared<Territory::ShaderStorageBuffer>(
             m_GridRes * m_GridRes * sizeof(int)
         );
-        // 槽位 2: 链表索引 (100,000 个 int)
+        // [槽位 2]: 链表索引 (空间哈希用)
         m_ParticleListSSBO = std::make_shared<Territory::ShaderStorageBuffer>(
             m_ParticleCount * sizeof(int)
         );
+        // [槽位 3]: 领地画布 (1280x720 个 int)，初始全部填满 -1 (中立)
+        std::vector<int> initialTerrain(1280 * 720, -1);
+        m_TerrainSSBO = std::make_shared<Territory::ShaderStorageBuffer>(
+            initialTerrain.data(), 
+            initialTerrain.size() * sizeof(int)
+        );
 
+        // ==========================================
         // 3. 编译着色器
+        // ==========================================
         m_SpatialHashShader = std::make_shared<Territory::Shader>("assets/shaders/compute/spatial_hash.comp");
         m_PhysicsShader = std::make_shared<Territory::Shader>("assets/shaders/compute/particles.comp");
+        
         m_RenderShader = std::make_shared<Territory::Shader>(
             "assets/shaders/graphics/instanced.vert",
             "assets/shaders/graphics/instanced.frag"
         );
+        m_TerrainShader = std::make_shared<Territory::Shader>(
+            "assets/shaders/graphics/terrain.vert",
+            "assets/shaders/graphics/terrain.frag"
+        );
 
-        // 4. 初始化组件
+        // ==========================================
+        // 4. 初始化组件与 Core Profile 修复
+        // ==========================================
         m_HashDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_SpatialHashShader);
         m_PhysicsDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_PhysicsShader);
         m_Renderer = std::make_unique<Territory::InstancedRenderer>();
+
+        // 【极其关键】：申请一个空的 VAO 通行证，欺骗 OpenGL Core Profile 管线
+        glCreateVertexArrays(1, &m_DummyVAO);
     }
 
     void OnUpdate(float deltaTime) override {
-        // --- 第一步：空间哈希构建阶段 (Hashing Pass) ---
+        // --- 步骤一：空间哈希构建阶段 (Hashing Pass) ---
         
-        // 1.1 极速清空网格头，所有格子设为 -1
         m_GridHeadSSBO->ClearInt(-1);
 
-        // 1.2 绑定三大 Buffer 槽位
         m_ParticleSSBO->Bind(0);
         m_GridHeadSSBO->Bind(1);
         m_ParticleListSSBO->Bind(2);
 
-        // 1.3 调度哈希着色器
         m_SpatialHashShader->Bind();
         m_SpatialHashShader->SetInt("u_ParticleCount", m_ParticleCount);
-        m_SpatialHashShader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0)); // 我们暂时只用 2D
+        m_SpatialHashShader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
         
         uint32_t workGroups = (m_ParticleCount + 255) / 256;
         m_HashDispatcher->DispatchWithBarrier(workGroups, 1, 1);
 
-        // --- 第二步：物理碰撞模拟阶段 (Physics Pass) ---
+        // --- 步骤二：自杀式涂地与物理模拟阶段 (Physics & Kamikaze Pass) ---
         
         m_PhysicsShader->Bind();
         m_PhysicsShader->SetFloat("u_DeltaTime", deltaTime);
         m_PhysicsShader->SetInt("u_ParticleCount", m_ParticleCount);
         m_PhysicsShader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
+        
+        // 挂载领地画布到 3 号槽位，并传递屏幕分辨率
+        m_TerrainSSBO->Bind(3); 
+        m_PhysicsShader->SetInt2("u_Resolution", glm::ivec2(1280, 720)); 
 
-        // 再次派发物理模拟。注意：由于我们在 DispatchWithBarrier 里加了 Shader Storage Barrier，
-        // 这里的物理着色器能保证读到上面哈希着色器刚刚写完的、热乎的链表数据。
         m_PhysicsDispatcher->DispatchWithBarrier(workGroups, 1, 1);
     }
 
     void OnRender() override {
-        // --- 第三步：实例化渲染阶段 (Render Pass) ---
+        // --- 步骤三：渲染阶段 (Render Pass) ---
+        
+        // 1. 先画底层的领地地形 (Terrain)
+        m_TerrainShader->Bind();
+        m_TerrainShader->SetInt2("u_Resolution", glm::ivec2(1280, 720));
+        m_TerrainSSBO->Bind(3);
+
+        // 出示空 VAO 通行证，发动神级技巧画全屏三角形
+        glBindVertexArray(m_DummyVAO); 
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        // 2. 再画上层的存活实体粒子 (Particles)
         m_Renderer->Draw(m_RenderShader, m_ParticleCount);
     }
 
 private:
     uint32_t m_ParticleCount;
     int m_GridRes;
+    uint32_t m_DummyVAO = 0; // 空的顶点数组对象句柄
 
     std::shared_ptr<Territory::ShaderStorageBuffer> m_ParticleSSBO;
     std::shared_ptr<Territory::ShaderStorageBuffer> m_GridHeadSSBO;
     std::shared_ptr<Territory::ShaderStorageBuffer> m_ParticleListSSBO;
+    std::shared_ptr<Territory::ShaderStorageBuffer> m_TerrainSSBO;
 
     std::shared_ptr<Territory::Shader> m_SpatialHashShader;
     std::shared_ptr<Territory::Shader> m_PhysicsShader;
     std::shared_ptr<Territory::Shader> m_RenderShader;
+    std::shared_ptr<Territory::Shader> m_TerrainShader;
 
     std::unique_ptr<Territory::ComputeDispatcher> m_HashDispatcher;
     std::unique_ptr<Territory::ComputeDispatcher> m_PhysicsDispatcher;
@@ -129,7 +172,7 @@ private:
 
 int main() {
     try {
-        Territory::WindowProps props("Territory Engine - 100k Spatial Particles", 1280, 720);
+        Territory::WindowProps props("Territory Engine - Kamikaze Paint", 1280, 720);
         ColorWarApp app(props);
         app.Run();
     }

@@ -8,117 +8,110 @@ struct Particle {
     vec4 color;
 };
 
-// 0: 粒子总池 (读写)
-layout(std430, binding = 0) buffer ParticleBuffer {
-    Particle particles[];
-};
-// 1: 网格表头 (只读)
-layout(std430, binding = 1) buffer GridHeadBuffer {
-    int gridHead[];
-};
-// 2: 链表数据 (只读)
-layout(std430, binding = 2) buffer LinkedListBuffer {
-    int particleList[];
-};
+// 0: 粒子总池 
+layout(std430, binding = 0) buffer ParticleBuffer { Particle particles[]; };
+// 1: 网格表头 
+layout(std430, binding = 1) buffer GridHeadBuffer { int gridHead[]; };
+// 2: 链表数据 
+layout(std430, binding = 2) buffer LinkedListBuffer { int particleList[]; };
+// 3: 【新增】领地画布
+layout(std430, binding = 3) buffer TerrainGridBuffer { int terrainGrid[]; };
 
 uniform float u_DeltaTime;
 uniform int u_ParticleCount;
 uniform ivec2 u_GridSize;
+// 【新增】屏幕分辨率，用于将坐标精确映射到像素网格
+uniform ivec2 u_Resolution; 
 
-// 粒子的物理半径 (与 Vertex Shader 里的 0.005 对应)
 const float RADIUS = 0.005;
 
 void main() {
     uint myID = gl_GlobalInvocationID.x;
     if (myID >= u_ParticleCount) return;
 
-    // 把自己的状态先读到寄存器里 (极速访问)
     Particle me = particles[myID];
+
+    // --- 【墓地判定】 ---
+    // 如果我已经被献祭（坐标在屏幕外），直接退出，不消耗任何算力
+    if (me.position.x > 10.0) return;
 
     // 1. 运动学积分
     me.position += me.velocity * u_DeltaTime;
 
-    // 2. 计算我当前所在的网格坐标
+    // 2. 空间哈希 O(1) 碰撞检测 (保持不变)
     vec2 normPos = clamp((me.position + 1.0) * 0.5, 0.0, 1.0);
     ivec2 myCell = ivec2(normPos * vec2(u_GridSize));
 
-    // ---------------------------------------------------------
-    // 3. 【高阶奥义：基于空间哈希表的 O(1) 邻域碰撞检测】
-    // ---------------------------------------------------------
-    // 遍历我周围 3x3 的 9 个格子 (包含我自己所在的格子)
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
-            
             ivec2 neighborCell = myCell + ivec2(x, y);
-            
-            // 越界检查
             if (neighborCell.x < 0 || neighborCell.x >= u_GridSize.x ||
-                neighborCell.y < 0 || neighborCell.y >= u_GridSize.y) {
-                continue;
-            }
+                neighborCell.y < 0 || neighborCell.y >= u_GridSize.y) continue;
 
-            // 计算邻居格子的 1D 索引
             int gridIndex = neighborCell.y * u_GridSize.x + neighborCell.x;
-            
-            // 拿到该格子的“表头指针”
             int currID = gridHead[gridIndex];
 
-            // 顺藤摸瓜：遍历这个格子里的所有粒子！
-            int loopLimit = 0; // 保险栓，防止极端堆积导致的死循环
+            int loopLimit = 0;
             while (currID != -1 && loopLimit < 50) {
-                // 不能和自己发生碰撞
                 if (currID != myID) {
                     Particle other = particles[currID];
-                    
-                    vec2 diff = me.position - other.position;
-                    float dist = length(diff);
-                    float minDist = RADIUS * 2.0;
+                    // 忽略墓地里的死尸粒子
+                    if (other.position.x < 10.0) {
+                        vec2 diff = me.position - other.position;
+                        float dist = length(diff);
+                        float minDist = RADIUS * 2.0;
 
-                    // 如果两球距离小于 2 倍半径，说明发生碰撞！
-                    if (dist > 0.0001 && dist < minDist) {
-                        vec2 normal = diff / dist;
-                        
-                        // a) 强制推开：防止两个粒子粘在一起 (位置修正)
-                        float overlap = minDist - dist;
-                        me.position += normal * overlap * 0.5;
+                        if (dist > 0.0001 && dist < minDist) {
+                            vec2 normal = diff / dist;
+                            float overlap = minDist - dist;
+                            me.position += normal * overlap * 0.5;
 
-                        // b) 弹性碰撞：动量交换 (速度修正)
-                        vec2 relativeVel = me.velocity - other.velocity;
-                        float velAlongNormal = dot(relativeVel, normal);
-                        
-                        // 只有当两个粒子正在互相靠近时才反弹
-                        if (velAlongNormal < 0.0) {
-                            // 假设质量相同，恢复系数为 1.0 (完全弹性碰撞)
-                            me.velocity -= normal * velAlongNormal * 1.0;
+                            vec2 relativeVel = me.velocity - other.velocity;
+                            float velAlongNormal = dot(relativeVel, normal);
+                            if (velAlongNormal < 0.0) {
+                                me.velocity -= normal * velAlongNormal * 1.0;
+                            }
                         }
                     }
                 }
-                // 核心：让指针跳向链表的下一个节点！
                 currID = particleList[currID];
                 loopLimit++;
             }
         }
     }
 
+    // 3. 边界反弹
+    if (me.position.x - RADIUS < -1.0) { me.position.x = -1.0 + RADIUS; me.velocity.x *= -1.0; } 
+    else if (me.position.x + RADIUS > 1.0) { me.position.x = 1.0 - RADIUS; me.velocity.x *= -1.0; }
+    if (me.position.y - RADIUS < -1.0) { me.position.y = -1.0 + RADIUS; me.velocity.y *= -1.0; } 
+    else if (me.position.y + RADIUS > 1.0) { me.position.y = 1.0 - RADIUS; me.velocity.y *= -1.0; }
+
     // ---------------------------------------------------------
-    // 4. 边界反弹检测 (带半径偏移)
+    // 4. 【高阶机制：自杀式涂地 (Kamikaze Paint)】
     // ---------------------------------------------------------
-    if (me.position.x - RADIUS < -1.0) {
-        me.position.x = -1.0 + RADIUS;
-        me.velocity.x *= -1.0;
-    } else if (me.position.x + RADIUS > 1.0) {
-        me.position.x = 1.0 - RADIUS;
-        me.velocity.x *= -1.0;
-    }
     
-    if (me.position.y - RADIUS < -1.0) {
-        me.position.y = -1.0 + RADIUS;
-        me.velocity.y *= -1.0;
-    } else if (me.position.y + RADIUS > 1.0) {
-        me.position.y = 1.0 - RADIUS;
-        me.velocity.y *= -1.0;
+    // a) 算出我当前踩在画布的哪一个确切像素上
+    vec2 uv = clamp((me.position + 1.0) * 0.5, 0.0, 1.0);
+    ivec2 pixelCoord = ivec2(uv * vec2(u_Resolution));
+    pixelCoord = clamp(pixelCoord, ivec2(0), u_Resolution - ivec2(1));
+    int pixelIndex = pixelCoord.y * u_Resolution.x + pixelCoord.x;
+
+    // b) 获取我的阵营 ID (与 main.cpp 里的初始分配逻辑一致：0红, 1绿, 2蓝)
+    int myTeam = int(myID) % 3;
+
+    // c) 侦测脚下的领地
+    int groundOwner = terrainGrid[pixelIndex];
+
+    // d) 如果脚下的地盘不是我的（中立区或敌占区）
+    if (groundOwner != myTeam) {
+        // 原子操作：强行把这块地改成我的颜色！
+        atomicExchange(terrainGrid[pixelIndex], myTeam);
+        
+        // 壮烈牺牲：将自己流放到墓地坐标，清空速度
+        me.position = vec2(999.0, 999.0);
+        me.velocity = vec2(0.0, 0.0);
     }
 
-    // 将算好的新状态写回 VRAM
+    // 5. 写回显存
     particles[myID] = me;
 }
