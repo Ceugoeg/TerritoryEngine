@@ -2,7 +2,7 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-// 我们的老朋友：粒子结构体
+// 粒子结构体
 struct Particle {
     vec2 position;
     vec2 velocity;
@@ -31,6 +31,8 @@ uniform ivec2 u_GridSize; // 网格划分的密度，比如 (128, 128)
 void main() {
     uint myID = gl_GlobalInvocationID.x;
     if (myID >= u_ParticleCount) return;
+
+    if (particles[myID].position.x > 10.0) return;
 
     // 1. 获取我的坐标，并将其从 [-1.0, 1.0] 映射到 [0.0, 1.0]
     vec2 pos = particles[myID].position;

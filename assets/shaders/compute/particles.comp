@@ -8,22 +8,41 @@ struct Particle {
     vec4 color;
 };
 
-// 0: 粒子总池 
 layout(std430, binding = 0) buffer ParticleBuffer { Particle particles[]; };
-// 1: 网格表头 
 layout(std430, binding = 1) buffer GridHeadBuffer { int gridHead[]; };
-// 2: 链表数据 
 layout(std430, binding = 2) buffer LinkedListBuffer { int particleList[]; };
-// 3: 【新增】领地画布
 layout(std430, binding = 3) buffer TerrainGridBuffer { int terrainGrid[]; };
 
 uniform float u_DeltaTime;
 uniform int u_ParticleCount;
 uniform ivec2 u_GridSize;
-// 【新增】屏幕分辨率，用于将坐标精确映射到像素网格
-uniform ivec2 u_Resolution; 
+uniform ivec2 u_Resolution;
+uniform float u_Time;
 
 const float RADIUS = 0.005;
+
+// PCG Hash
+uint randHash(inout uint state) {
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+float randFloat(inout uint state) {
+    return float(randHash(state)) / 4294967295.0;
+}
+
+// 【全新配置：四分之一定位点】
+const vec2 BASES[4] = vec2[](
+    vec2(-0.5, -0.5), // 0: 左下
+    vec2(-0.5,  0.5), // 1: 左上
+    vec2( 0.5, -0.5), // 2: 右下
+    vec2( 0.5,  0.5)  // 3: 右上
+);
 
 void main() {
     uint myID = gl_GlobalInvocationID.x;
@@ -31,31 +50,55 @@ void main() {
 
     Particle me = particles[myID];
 
-    // --- 【墓地判定】 ---
-    // 如果我已经被献祭（坐标在屏幕外），直接退出，不消耗任何算力
-    if (me.position.x > 10.0) return;
+    // ==========================================
+    // 【旋转炮台秽土转生逻辑】
+    // ==========================================
+    if (me.position.x > 10.0) {
+        uint seed = myID + uint(u_Time * 10000.0);
+        
+        // 依然是 1% 的重生概率控制流量
+        if (randFloat(seed) < 0.01) {
+            int myTeam = int(myID) % 4; // 改成 4 个阵营
+            me.position = BASES[myTeam];
+            
+            // 设定旋转参数
+            float rotSpeed = 2.0; // 炮管旋转角速度
+            float dir = (myTeam < 2) ? -1.0 : 1.0; // 左边两个(<2)顺时针为负，右边两个逆时针为正
+            
+            // 计算当前时间的绝对角度
+            float baseAngle = dir * rotSpeed * u_Time;
+            
+            // 加入极微小的随机扰动 (0.05弧度)，让射线看起来像喷火器而不是死板的一条细线
+            float angle = baseAngle + (randFloat(seed) - 0.5) * 0.05;
+            
+            // 赋予沿射线的速度，加入速度差异拉开粒子间距
+            float speed = randFloat(seed) * 0.6 + 0.4;
+            me.velocity = vec2(cos(angle), sin(angle)) * speed;
+            
+            me.color = vec4(1.0); // 纯白色波浪
+        } else {
+            return;
+        }
+    }
 
-    // 1. 运动学积分
+    // --- 后续碰撞与涂地逻辑 ---
     me.position += me.velocity * u_DeltaTime;
 
-    // 2. 空间哈希 O(1) 碰撞检测 (保持不变)
     vec2 normPos = clamp((me.position + 1.0) * 0.5, 0.0, 1.0);
     ivec2 myCell = ivec2(normPos * vec2(u_GridSize));
 
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
             ivec2 neighborCell = myCell + ivec2(x, y);
-            if (neighborCell.x < 0 || neighborCell.x >= u_GridSize.x ||
-                neighborCell.y < 0 || neighborCell.y >= u_GridSize.y) continue;
+            if (neighborCell.x < 0 || neighborCell.x >= u_GridSize.x || neighborCell.y < 0 || neighborCell.y >= u_GridSize.y) continue;
 
             int gridIndex = neighborCell.y * u_GridSize.x + neighborCell.x;
             int currID = gridHead[gridIndex];
-
             int loopLimit = 0;
+            
             while (currID != -1 && loopLimit < 50) {
                 if (currID != myID) {
                     Particle other = particles[currID];
-                    // 忽略墓地里的死尸粒子
                     if (other.position.x < 10.0) {
                         vec2 diff = me.position - other.position;
                         float dist = length(diff);
@@ -63,9 +106,7 @@ void main() {
 
                         if (dist > 0.0001 && dist < minDist) {
                             vec2 normal = diff / dist;
-                            float overlap = minDist - dist;
-                            me.position += normal * overlap * 0.5;
-
+                            me.position += normal * (minDist - dist) * 0.5;
                             vec2 relativeVel = me.velocity - other.velocity;
                             float velAlongNormal = dot(relativeVel, normal);
                             if (velAlongNormal < 0.0) {
@@ -80,38 +121,24 @@ void main() {
         }
     }
 
-    // 3. 边界反弹
     if (me.position.x - RADIUS < -1.0) { me.position.x = -1.0 + RADIUS; me.velocity.x *= -1.0; } 
     else if (me.position.x + RADIUS > 1.0) { me.position.x = 1.0 - RADIUS; me.velocity.x *= -1.0; }
     if (me.position.y - RADIUS < -1.0) { me.position.y = -1.0 + RADIUS; me.velocity.y *= -1.0; } 
     else if (me.position.y + RADIUS > 1.0) { me.position.y = 1.0 - RADIUS; me.velocity.y *= -1.0; }
 
-    // ---------------------------------------------------------
-    // 4. 【高阶机制：自杀式涂地 (Kamikaze Paint)】
-    // ---------------------------------------------------------
-    
-    // a) 算出我当前踩在画布的哪一个确切像素上
     vec2 uv = clamp((me.position + 1.0) * 0.5, 0.0, 1.0);
     ivec2 pixelCoord = ivec2(uv * vec2(u_Resolution));
     pixelCoord = clamp(pixelCoord, ivec2(0), u_Resolution - ivec2(1));
     int pixelIndex = pixelCoord.y * u_Resolution.x + pixelCoord.x;
 
-    // b) 获取我的阵营 ID (与 main.cpp 里的初始分配逻辑一致：0红, 1绿, 2蓝)
-    int myTeam = int(myID) % 3;
-
-    // c) 侦测脚下的领地
+    int myTeam = int(myID) % 4; // 【修改】这里也要取模 4
     int groundOwner = terrainGrid[pixelIndex];
 
-    // d) 如果脚下的地盘不是我的（中立区或敌占区）
     if (groundOwner != myTeam) {
-        // 原子操作：强行把这块地改成我的颜色！
         atomicExchange(terrainGrid[pixelIndex], myTeam);
-        
-        // 壮烈牺牲：将自己流放到墓地坐标，清空速度
         me.position = vec2(999.0, 999.0);
         me.velocity = vec2(0.0, 0.0);
     }
 
-    // 5. 写回显存
     particles[myID] = me;
 }
