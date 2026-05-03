@@ -14,6 +14,7 @@ add_library(TerritoryCore
     src/Renderer/Shader.cpp
     src/Memory/ShaderStorageBuffer.cpp
     src/Pipeline/ComputeDispatcher.cpp
+    src/Renderer/InstancedRenderer.cpp
 )
 
 target_include_directories(TerritoryCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
