@@ -1,13 +1,13 @@
 #include <Territory/Core/Application.hpp>
+#include <Territory/Core/Config.hpp>
 #include <Territory/Renderer/Shader.hpp>
-#include <Territory/Memory/ShaderStorageBuffer.hpp>
 #include <Territory/Memory/BufferManager.hpp>
 #include <Territory/Pipeline/ComputeDispatcher.hpp>
+#include <Territory/Pipeline/Pipeline.hpp>
 #include <Territory/Renderer/InstancedRenderer.hpp>
 
 #include <iostream>
 #include <vector>
-#include <random>
 #include <glad/glad.h>
 
 // 严格对齐 GLSL std430 布局
@@ -17,147 +17,189 @@ struct Particle {
     glm::vec4 color;
 };
 
-class ColorWarApp : public Territory::Application {
+// =========================================================
+// 业务组件 1：空间哈希通道 (引擎基础设施)
+// =========================================================
+class SpatialHashPass : public Territory::Pass {
 public:
-    ColorWarApp(const Territory::WindowProps& props) 
-        : Territory::Application(props), 
-          m_ParticleCount(100000), 
-          m_GridRes(128) {}
-
-    ~ColorWarApp() {
-        if (m_DummyVAO != 0) {
-            glDeleteVertexArrays(1, &m_DummyVAO);
-        }
-        // 清理全局显存管家，释放所有 SSBO 句柄
-        Territory::BufferManager::Get().Clear();
+    SpatialHashPass(uint32_t count, int gridRes) 
+        : Territory::Pass("SpatialHashPass"), m_Count(count), m_GridRes(gridRes) {
+        m_Shader = std::make_shared<Territory::Shader>("assets/shaders/compute/spatial_hash.comp");
+        m_Dispatcher = std::make_unique<Territory::ComputeDispatcher>(m_Shader);
     }
 
-protected:
-    void OnInit() override {
-        std::cout << "[ColorWar] Initializing Decoupled GPU-Driven Pipeline...\n";
-
-        // 1. 生成初始数据
-        std::vector<Particle> initialParticles(m_ParticleCount);
-        for (int i = 0; i < m_ParticleCount; ++i) {
-            initialParticles[i].position = { 999.0f, 999.0f }; // 开局置于墓地
-            initialParticles[i].velocity = { 0.0f, 0.0f };
-            initialParticles[i].color = { 1.0f, 1.0f, 1.0f, 1.0f };
-        }
-
-        std::vector<int> initialTerrain(1280 * 720, -1); // 全屏中立领地
-
-        // =========================================================
-        // 2. 利用 BufferManager 进行统一显存分配
-        // =========================================================
+    void Execute(float deltaTime) override {
         auto& bm = Territory::BufferManager::Get();
-        
-        bm.Create("Particles", m_ParticleCount * sizeof(Particle), initialParticles.data());
-        bm.Create("GridHead", m_GridRes * m_GridRes * sizeof(int));
-        bm.Create("ParticleList", m_ParticleCount * sizeof(int));
-        bm.Create("Terrain", initialTerrain.size() * sizeof(int), initialTerrain.data());
-
-        // =========================================================
-        // 3. 编译着色器（区分引擎级与实例级路径）
-        // =========================================================
-        
-        // 引擎核心算法
-        m_SpatialHashShader = std::make_shared<Territory::Shader>("assets/shaders/compute/spatial_hash.comp");
-        m_RenderShader = std::make_shared<Territory::Shader>(
-            "assets/shaders/graphics/instanced.vert", 
-            "assets/shaders/graphics/instanced.frag"
-        );
-        m_TerrainVertexShader = "assets/shaders/graphics/terrain.vert"; // 引擎通用顶点生成
-
-        // 实例业务逻辑
-        m_PhysicsShader = std::make_shared<Territory::Shader>("examples/ColorWar/shaders/particles.comp");
-        m_TerrainShader = std::make_shared<Territory::Shader>(
-            m_TerrainVertexShader, 
-            "examples/ColorWar/shaders/terrain.frag"
-        );
-
-        // 4. 初始化调度器与渲染器
-        m_HashDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_SpatialHashShader);
-        m_PhysicsDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_PhysicsShader);
-        m_Renderer = std::make_unique<Territory::InstancedRenderer>();
-
-        // 申请 Dummy VAO 用于全屏三角形绘制
-        glCreateVertexArrays(1, &m_DummyVAO);
-    }
-
-    void OnUpdate(float deltaTime) override {
-        auto& bm = Territory::BufferManager::Get();
-
-        // --- 步骤一：空间哈希构建 (Hashing Pass) ---
         bm.GetBuffer("GridHead")->ClearInt(-1);
         
         bm.Bind("Particles", 0);
         bm.Bind("GridHead", 1);
         bm.Bind("ParticleList", 2);
 
-        m_SpatialHashShader->Bind();
-        m_SpatialHashShader->SetInt("u_ParticleCount", m_ParticleCount);
-        m_SpatialHashShader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
+        m_Shader->Bind();
+        m_Shader->SetInt("u_ParticleCount", m_Count);
+        m_Shader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
         
-        uint32_t workGroups = (m_ParticleCount + 255) / 256;
-        m_HashDispatcher->DispatchWithBarrier(workGroups, 1, 1);
+        m_Dispatcher->DispatchWithBarrier((m_Count + 255) / 256, 1, 1);
+    }
+private:
+    uint32_t m_Count; int m_GridRes;
+    std::shared_ptr<Territory::Shader> m_Shader;
+    std::unique_ptr<Territory::ComputeDispatcher> m_Dispatcher;
+};
 
-        // --- 步骤二：物理模拟与炮台重生 (Physics Pass) ---
-        static float s_TotalTime = 0.0f;
-        s_TotalTime += deltaTime;
-
-        m_PhysicsShader->Bind();
-        m_PhysicsShader->SetFloat("u_DeltaTime", deltaTime);
-        m_PhysicsShader->SetFloat("u_Time", s_TotalTime);
-        m_PhysicsShader->SetInt("u_ParticleCount", m_ParticleCount);
-        m_PhysicsShader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
-        
-        bm.Bind("Terrain", 3); 
-        m_PhysicsShader->SetInt2("u_Resolution", glm::ivec2(1280, 720)); 
-
-        m_PhysicsDispatcher->DispatchWithBarrier(workGroups, 1, 1);
+// =========================================================
+// 业务组件 2：物理与炮台逻辑通道 (实例特化业务)
+// =========================================================
+class PhysicsPass : public Territory::Pass {
+public:
+    PhysicsPass(uint32_t count, int gridRes) 
+        : Territory::Pass("PhysicsPass"), m_Count(count), m_GridRes(gridRes) {
+        // 加载实例专属的业务 Shader
+        m_Shader = std::make_shared<Territory::Shader>("examples/ColorWar/shaders/particles.comp");
+        m_Dispatcher = std::make_unique<Territory::ComputeDispatcher>(m_Shader);
     }
 
-    void OnRender() override {
+    void Execute(float deltaTime) override {
+        m_TotalTime += deltaTime;
         auto& bm = Territory::BufferManager::Get();
 
-        // 1. 渲染底层领地 (Terrain)
-        m_TerrainShader->Bind();
-        m_TerrainShader->SetInt2("u_Resolution", glm::ivec2(1280, 720));
-        bm.Bind("Terrain", 3); 
+        m_Shader->Bind();
+        m_Shader->SetFloat("u_DeltaTime", deltaTime);
+        m_Shader->SetFloat("u_Time", m_TotalTime);
+        m_Shader->SetInt("u_ParticleCount", m_Count);
+        m_Shader->SetVec3("u_GridSize", glm::vec3(m_GridRes, m_GridRes, 0));
         
-        glBindVertexArray(m_DummyVAO); 
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        bm.Bind("Terrain", 3); 
+        m_Shader->SetInt2("u_Resolution", glm::ivec2(1280, 720)); 
 
-        // 2. 渲染顶层粒子 (Particles)
-        m_Renderer->Draw(m_RenderShader, m_ParticleCount);
+        m_Dispatcher->DispatchWithBarrier((m_Count + 255) / 256, 1, 1);
+    }
+private:
+    uint32_t m_Count; int m_GridRes; float m_TotalTime = 0.0f;
+    std::shared_ptr<Territory::Shader> m_Shader;
+    std::unique_ptr<Territory::ComputeDispatcher> m_Dispatcher;
+};
+
+// =========================================================
+// 业务组件 3：双层渲染通道 (混合设施)
+// =========================================================
+class RenderPass : public Territory::Pass {
+public:
+    RenderPass(uint32_t count, int width, int height) 
+        : Territory::Pass("RenderPass"), m_Count(count), m_Width(width), m_Height(height) {
+        
+        // 底层画布：通用顶点 + 实例专属的四色阵营渲染
+        m_TerrainShader = std::make_shared<Territory::Shader>(
+            "assets/shaders/graphics/terrain.vert", 
+            "examples/ColorWar/shaders/terrain.frag"
+        );
+        
+        // 顶层粒子：通用实例化渲染
+        m_ParticleShader = std::make_shared<Territory::Shader>(
+            "assets/shaders/graphics/instanced.vert", 
+            "assets/shaders/graphics/instanced.frag"
+        );
+        
+        m_Renderer = std::make_unique<Territory::InstancedRenderer>();
+        
+        // 申请 Dummy VAO 欺骗 Core Profile
+        glCreateVertexArrays(1, &m_DummyVAO);
+    }
+    
+    ~RenderPass() { 
+        glDeleteVertexArrays(1, &m_DummyVAO); 
     }
 
+    void Execute(float deltaTime) override {
+        auto& bm = Territory::BufferManager::Get();
+        
+        // 1. 画底层领地
+        m_TerrainShader->Bind();
+        m_TerrainShader->SetInt2("u_Resolution", glm::ivec2(m_Width, m_Height));
+        bm.Bind("Terrain", 3); 
+        glBindVertexArray(m_DummyVAO); 
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        
+        // 2. 画顶层粒子
+        m_Renderer->Draw(m_ParticleShader, m_Count);
+    }
 private:
-    uint32_t m_ParticleCount;
-    int m_GridRes;
-    uint32_t m_DummyVAO = 0;
-
-    std::string m_TerrainVertexShader;
-
-    // 引擎组件
-    std::shared_ptr<Territory::Shader> m_SpatialHashShader;
-    std::shared_ptr<Territory::Shader> m_PhysicsShader;
-    std::shared_ptr<Territory::Shader> m_RenderShader;
+    uint32_t m_Count; int m_Width; int m_Height; uint32_t m_DummyVAO;
     std::shared_ptr<Territory::Shader> m_TerrainShader;
-
-    std::unique_ptr<Territory::ComputeDispatcher> m_HashDispatcher;
-    std::unique_ptr<Territory::ComputeDispatcher> m_PhysicsDispatcher;
+    std::shared_ptr<Territory::Shader> m_ParticleShader;
     std::unique_ptr<Territory::InstancedRenderer> m_Renderer;
 };
 
+// =========================================================
+// 主体 App：极其干净，完全数据驱动，只负责按配置组装管线！
+// =========================================================
+class ColorWarApp : public Territory::Application {
+public:
+    ColorWarApp(const Territory::WindowProps& props, const Territory::SimulationConfig& config) 
+        : Territory::Application(props), m_Config(config) {}
+
+    ~ColorWarApp() { 
+        // 引擎退出时释放所有显存
+        Territory::BufferManager::Get().Clear(); 
+    }
+
+protected:
+    void OnInit() override {
+        std::cout << "[TerritoryEngine] Loading Data-Driven Level...\n";
+
+        // 1. 根据注入的 Config 生成初始数据
+        std::vector<Particle> initParticles(m_Config.ParticleCount, { {999.f, 999.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f} });
+        std::vector<int> initTerrain(m_Config.WindowWidth * m_Config.WindowHeight, -1);
+
+        // 2. 向全局显存管家注册缓冲
+        auto& bm = Territory::BufferManager::Get();
+        bm.Create("Particles", m_Config.ParticleCount * sizeof(Particle), initParticles.data());
+        bm.Create("GridHead", m_Config.GridResolution * m_Config.GridResolution * sizeof(int));
+        bm.Create("ParticleList", m_Config.ParticleCount * sizeof(int));
+        bm.Create("Terrain", initTerrain.size() * sizeof(int), initTerrain.data());
+
+        // 3. 将 Pass 组装进 Pipeline
+        m_Pipeline.AddPass(std::make_shared<SpatialHashPass>(m_Config.ParticleCount, m_Config.GridResolution));
+        m_Pipeline.AddPass(std::make_shared<PhysicsPass>(m_Config.ParticleCount, m_Config.GridResolution));
+        m_RenderPipeline.AddPass(std::make_shared<RenderPass>(m_Config.ParticleCount, m_Config.WindowWidth, m_Config.WindowHeight));
+    }
+
+    void OnUpdate(float deltaTime) override {
+        // 无脑扣动计算扳机
+        m_Pipeline.ExecuteAll(deltaTime);
+    }
+
+    void OnRender() override {
+        // 无脑扣动渲染扳机
+        m_RenderPipeline.ExecuteAll(0.0f);
+    }
+
+private:
+    Territory::SimulationConfig m_Config; 
+    Territory::Pipeline m_Pipeline;
+    Territory::Pipeline m_RenderPipeline;
+};
+
+// =========================================================
+// 程序的真正入口：模拟读取配置
+// =========================================================
 int main() {
     try {
-        Territory::WindowProps props("Territory Engine - Decoupled Architecture", 1280, 720);
-        ColorWarApp app(props);
+        // 未来这里可以替换成从 external_level.json 读取
+        Territory::SimulationConfig config;
+        config.ParticleCount = 100000;
+        config.GridResolution = 128;
+        config.WindowWidth = 1280;
+        config.WindowHeight = 720;
+        
+        Territory::WindowProps props("Territory Engine - Data Driven Level", config.WindowWidth, config.WindowHeight);
+        ColorWarApp app(props, config);
+        
         app.Run();
     }
     catch (const std::exception& e) {
-        std::cerr << "Engine Fatal Error: " << e.what() << '\n';
+        std::cerr << "Engine Fatal Error: " << e.what() << '\n'; 
         return -1;
     }
     return 0;
