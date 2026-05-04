@@ -2,20 +2,20 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-// 显存对齐极度警告！保证结构体大小是 16 bytes (4 floats) 的整数倍
+// 【关键对齐】：这里必须是 isActive！
 struct Ball {
     vec2 position;   // 8 bytes
     vec2 velocity;   // 8 bytes
     vec4 color;      // 16 bytes
     float radius;    // 4 bytes
-    int active;      // 4 bytes
-    vec2 padding;    // 8 bytes (手动填充，总计 48 bytes)
+    int isActive;    // 4 bytes (不能用 active！)
+    vec2 padding;    // 8 bytes
 };
 
 struct Peg {
     vec2 position;   // 8 bytes
     float radius;    // 4 bytes
-    float padding;   // 4 bytes (手动填充，总计 16 bytes)
+    float padding;   // 4 bytes
 };
 
 layout(std430, binding = 0) buffer BallBuffer { Ball balls[]; };
@@ -26,7 +26,6 @@ uniform int u_BallCount;
 uniform int u_PegCount;
 uniform float u_Gravity;
 
-// 简单的伪随机数，用于错开出生位置
 uint randHash(inout uint state) {
     state ^= 2747636419u;
     state *= 2654435769u;
@@ -46,49 +45,42 @@ void main() {
     if (id >= u_BallCount) return;
 
     Ball b = balls[id];
-    if (b.active == 0) return;
+    
+    // 【关键调用】：与上面的结构体严格对应！
+    if (b.isActive == 0) return;
 
     // 1. 重力积分 (欧拉法)
-    // 假设 y 轴正方向朝上，重力拉向下方
     b.velocity.y -= u_Gravity * u_DeltaTime; 
     b.position += b.velocity * u_DeltaTime;
 
     // 2. 小球 vs 静态钉子 碰撞检测 (Circle-Circle)
-    // 几百个钉子，直接暴力循环即可，不需要空间哈希
     for(int i = 0; i < u_PegCount; ++i) {
         Peg p = pegs[i];
         vec2 diff = b.position - p.position;
         float dist = length(diff);
         float minDist = b.radius + p.radius;
 
-        // 如果距离小于两半径之和，说明发生了穿透！
         if(dist < minDist && dist > 0.0001) {
-            vec2 normal = diff / dist; // 碰撞法线
-            float depth = minDist - dist; // 穿透深度
+            vec2 normal = diff / dist;
+            float depth = minDist - dist;
             
-            // a) 位置修正：强行把小球推出钉子内部
             b.position += normal * depth; 
 
-            // b) 动量反弹 (基于弹性系数 Restitution)
             float velAlongNormal = dot(b.velocity, normal);
             if(velAlongNormal < 0.0) {
-                float restitution = 0.6; // 钉子的弹力，越大弹得越高
+                float restitution = 0.6; 
                 b.velocity -= (1.0 + restitution) * velAlongNormal * normal;
             }
         }
     }
 
     // 3. 屏幕边界与轮回机制
-    // 左右撞墙反弹
     if (b.position.x - b.radius < -1.0) { b.position.x = -1.0 + b.radius; b.velocity.x *= -0.8; }
     if (b.position.x + b.radius > 1.0)  { b.position.x =  1.0 - b.radius; b.velocity.x *= -0.8; }
     
-    // 如果掉出屏幕底部（落入底槽）
     if (b.position.y - b.radius < -1.0) {
-        // TODO: 这里未来会触发给领地母巢加能量的逻辑！
-        // 现在我们先把它传送到屏幕顶部重新落下
         uint seed = id + uint(b.position.x * 10000.0);
-        b.position = vec2((randFloat(seed) * 2.0 - 1.0) * 0.8, 1.0); // 顶部随机 X 位置下落
+        b.position = vec2((randFloat(seed) * 2.0 - 1.0) * 0.8, 1.0); 
         b.velocity = vec2(0.0);
     }
 
