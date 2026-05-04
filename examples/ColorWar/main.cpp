@@ -28,7 +28,7 @@ public:
 
 protected:
     void OnInit() override {
-        std::cout << "[ColorWar] Initializing 4-Turret Simulation...\n";
+        std::cout << "[ColorWar] Initializing Decoupled Simulation...\n";
 
         std::vector<Particle> initialParticles(m_ParticleCount);
         for (int i = 0; i < m_ParticleCount; ++i) {
@@ -44,10 +44,27 @@ protected:
         std::vector<int> initialTerrain(1280 * 720, -1);
         m_TerrainSSBO = std::make_shared<Territory::ShaderStorageBuffer>(initialTerrain.data(), initialTerrain.size() * sizeof(int));
 
+        // =========================================================
+        // 【路径重构】：区分引擎级基础 Shader 与 实例级业务 Shader
+        // =========================================================
+        
+        // 1. 引擎级算法：空间哈希
         m_SpatialHashShader = std::make_shared<Territory::Shader>("assets/shaders/compute/spatial_hash.comp");
-        m_PhysicsShader = std::make_shared<Territory::Shader>("assets/shaders/compute/particles.comp");
-        m_RenderShader = std::make_shared<Territory::Shader>("assets/shaders/graphics/instanced.vert", "assets/shaders/graphics/instanced.frag");
-        m_TerrainShader = std::make_shared<Territory::Shader>("assets/shaders/graphics/terrain.vert", "assets/shaders/graphics/terrain.frag");
+        
+        // 2. 实例级业务：旋转炮台与涂地逻辑
+        m_PhysicsShader = std::make_shared<Territory::Shader>("examples/ColorWar/shaders/particles.comp");
+        
+        // 3. 引擎级算法：通用实例化渲染器
+        m_RenderShader = std::make_shared<Territory::Shader>(
+            "assets/shaders/graphics/instanced.vert", 
+            "assets/shaders/graphics/instanced.frag"
+        );
+        
+        // 4. 混合：引擎级的全屏三角形顶点生成器 + 实例级的四色阵营片元着色器
+        m_TerrainShader = std::make_shared<Territory::Shader>(
+            "assets/shaders/graphics/terrain.vert", 
+            "examples/ColorWar/shaders/terrain.frag"
+        );
 
         m_HashDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_SpatialHashShader);
         m_PhysicsDispatcher = std::make_unique<Territory::ComputeDispatcher>(m_PhysicsShader);
@@ -116,7 +133,7 @@ private:
 
 int main() {
     try {
-        Territory::WindowProps props("Territory Engine - 4 Turrets", 1280, 720);
+        Territory::WindowProps props("Territory Engine - Decoupled App", 1280, 720);
         ColorWarApp app(props);
         app.Run();
     }
